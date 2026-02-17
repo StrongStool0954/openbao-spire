@@ -1,0 +1,8 @@
+func getConfigValue(configMap map[string]string, key, defaultValue string) string {
+	if configMap != nil {
+		if val, ok := configMap[key]; ok {
+			return val
+		}
+	}
+	return defaultValue
+}

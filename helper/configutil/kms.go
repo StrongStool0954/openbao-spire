@@ -26,9 +26,9 @@ import (
 	"github.com/openbao/go-kms-wrapping/wrappers/ocikms/v2"
 	statickms "github.com/openbao/go-kms-wrapping/wrappers/static/v2"
 	"github.com/openbao/go-kms-wrapping/wrappers/transit/v2"
-	spireseal "github.com/openbao/openbao/vault/seal/spire"
 	"github.com/openbao/openbao/sdk/v2/helper/hclutil"
 	"github.com/openbao/openbao/sdk/v2/logical"
+	spireseal "github.com/openbao/openbao/vault/seal/spire"
 )
 
 var (
@@ -197,11 +197,11 @@ func configureWrapper(configKMS *KMS, infoKeys *[]string, info *map[string]strin
 	case wrapping.WrapperTypeTransit:
 		wrapper, kmsInfo, err = GetTransitKMSFunc(configKMS, opts...)
 
-	case spireseal.WrapperTypeSPIRE:
-		wrapper, kmsInfo, err = GetSPIREFunc(configKMS, opts...)
-
 	case wrapping.WrapperTypePkcs11:
 		wrapper, kmsInfo, err = GetPKCS11KMSFunc(configKMS, opts...)
+
+	case spireseal.WrapperTypeSPIRE:
+		wrapper, kmsInfo, err = GetSPIREFunc(configKMS, opts...)
 
 	case wrapping.WrapperTypeKmip:
 		wrapper, kmsInfo, err = GetKmipKMSFunc(configKMS, opts...)
@@ -409,4 +409,3 @@ func GetSPIREFunc(kms *KMS, opts ...wrapping.Option) (wrapping.Wrapper, map[stri
 	}
 	return wrapper, info, nil
 }
-
