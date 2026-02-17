@@ -8,6 +8,7 @@ package spire
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
@@ -32,6 +33,7 @@ type Wrapper struct {
 	svidMutex     sync.RWMutex
 
 	pkcs11Wrapper wrapping.Wrapper
+	configMap     map[string]string  // Store config for Init
 
 	ctx           context.Context
 	cancel        context.CancelFunc
@@ -47,15 +49,29 @@ func (w *Wrapper) SetConfig(ctx context.Context, options ...wrapping.Option) (*w
 		return nil, err
 	}
 
+	// Store the full config map for later use in Init
+	if opts.WithConfigMap != nil {
+		w.configMap = make(map[string]string)
+		for k, v := range opts.WithConfigMap {
+			w.configMap[k] = v
+		}
+	}
+
 	w.socketPath = getConfigValue(opts.WithConfigMap, "socket_path", "/run/spire/sockets/agent.sock")
 	w.trustDomain = getConfigValue(opts.WithConfigMap, "trust_domain", "funlab.casa")
-	
+
 	pkcs11Lib := getConfigValue(opts.WithConfigMap, "pkcs11_lib", "")
 	if pkcs11Lib == "" {
 		return nil, fmt.Errorf("pkcs11_lib must be specified")
 	}
 
-	w.logger = hclog.NewNullLogger()
+	// Create a console logger for debugging
+	w.logger = hclog.New(&hclog.LoggerOptions{
+		Name:   "spire-seal",
+		Level:  hclog.Debug,
+		Output: os.Stderr,
+	})
+	w.logger.Info("========== SPIRE SEAL SETCONFIG CALLED ==========", "socket_path", w.socketPath, "trust_domain", w.trustDomain)
 
 	return &wrapping.WrapperConfig{
 		Metadata: map[string]string{
@@ -68,28 +84,34 @@ func (w *Wrapper) SetConfig(ctx context.Context, options ...wrapping.Option) (*w
 }
 
 func (w *Wrapper) Init(ctx context.Context, options ...wrapping.Option) error {
-	w.logger.Info("initializing SPIRE seal", "socket_path", w.socketPath)
+	w.logger.Info("========== SPIRE SEAL INIT CALLED ==========", "socket_path", w.socketPath)
 
 	client, err := workloadapi.New(ctx, workloadapi.WithAddr("unix://"+w.socketPath))
 	if err != nil {
+		w.logger.Error("FAILED to create SPIRE workload API client", "error", err, "socket_path", w.socketPath)
 		return fmt.Errorf("failed to create SPIRE workload API client: %w", err)
 	}
 	w.spireClient = client
+	w.logger.Info("SPIRE workload API client created successfully")
 
 	if err := w.refreshSVID(ctx); err != nil {
+		w.logger.Error("FAILED to fetch initial SVID", "error", err)
 		w.spireClient.Close()
 		return fmt.Errorf("failed to fetch initial SVID (attestation failed): %w", err)
 	}
 
-	w.logger.Info("SPIRE attestation successful, initializing PKCS11 backend")
+	w.logger.Info("========== SPIRE ATTESTATION SUCCESSFUL, INITIALIZING PKCS11 ==========")
 
-	opts, _ := wrapping.GetOpts(options...)
-
+	// Use stored config map instead of expecting options
 	pkcs11Config := make(map[string]string)
-	if opts.WithConfigMap != nil {
-		for k, v := range opts.WithConfigMap {
+	if w.configMap != nil {
+		for k, v := range w.configMap {
 			if len(k) > 7 && k[:7] == "pkcs11_" {
+				// Strip pkcs11_ prefix
 				pkcs11Config[k[7:]] = v
+			} else if k == "key_label" || k == "hmac_key_label" {
+				// Pass through key_label and hmac_key_label directly
+				pkcs11Config[k] = v
 			}
 		}
 	}

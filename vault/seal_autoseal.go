@@ -67,6 +67,13 @@ func NewAutoSeal(lowLevel seal.Access) (*autoSeal, error) {
 		return nil, err
 	}
 
+	// Initialize the seal wrapper if it supports initialization
+	if initWrapper, ok := lowLevel.(wrapping.InitFinalizer); ok {
+		if err := initWrapper.Init(context.Background()); err != nil {
+			return nil, fmt.Errorf("failed to initialize auto seal: %w", err)
+		}
+	}
+
 	return ret, nil
 }
 

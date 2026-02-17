@@ -1811,6 +1811,15 @@ func (c *Core) migrateSeal(ctx context.Context) error {
 
 	c.logger.Info("seal migration initiated")
 
+	// Initialize the new seal wrapper before using it
+	if initWrapper, ok := c.seal.GetAccess().(wrapping.InitFinalizer); ok {
+		c.logger.Info("initializing new seal wrapper for migration")
+		if err := initWrapper.Init(ctx); err != nil {
+			return fmt.Errorf("error initializing new seal wrapper: %w", err)
+		}
+		c.logger.Info("new seal wrapper initialized successfully")
+	}
+
 	switch {
 	case c.migrationInfo.seal.RecoveryKeySupported() && c.seal.RecoveryKeySupported():
 		c.logger.Info("migrating from one auto-unseal to another", "from",
