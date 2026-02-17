@@ -29,8 +29,10 @@ type Wrapper struct {
 	trustDomain   string
 	logger        hclog.Logger
 
-	currentSVID   *x509svid.SVID
-	svidMutex     sync.RWMutex
+	currentSVID      *x509svid.SVID
+	svidMutex        sync.RWMutex
+	attestationLost  bool          // True when attestation fails and vault should seal
+	attestationMutex sync.RWMutex
 
 	pkcs11Wrapper wrapping.Wrapper
 	configMap     map[string]string  // Store config for Init
@@ -210,6 +212,26 @@ func (w *Wrapper) checkSVIDValid() error {
 	return nil
 }
 
+// AttestationFailed returns true if attestation has been lost and the vault should seal for security
+func (w *Wrapper) AttestationFailed() bool {
+	w.attestationMutex.RLock()
+	defer w.attestationMutex.RUnlock()
+	return w.attestationLost
+}
+
+// AttestationRestored returns true if attestation was lost but has now been recovered
+func (w *Wrapper) AttestationRestored() bool {
+	w.attestationMutex.RLock()
+	defer w.attestationMutex.RUnlock()
+
+	w.svidMutex.RLock()
+	hasSVID := w.currentSVID != nil
+	w.svidMutex.RUnlock()
+
+	// Attestation is restored if we previously lost it but now have a valid SVID
+	return !w.attestationLost && hasSVID
+}
+
 func (w *Wrapper) refreshSVID(ctx context.Context) error {
 	w.logger.Debug("fetching SVID from SPIRE")
 
@@ -230,11 +252,14 @@ func (w *Wrapper) refreshSVID(ctx context.Context) error {
 }
 
 func (w *Wrapper) monitorSVID() {
-	ticker := time.NewTicker(30 * time.Second)
+	normalInterval := 30 * time.Second
+	recoveryInterval := 60 * time.Second
+	ticker := time.NewTicker(normalInterval)
 	defer ticker.Stop()
 
 	consecutiveFailures := 0
 	maxFailures := 3
+	inRecoveryMode := false
 
 	for {
 		select {
@@ -245,23 +270,47 @@ func (w *Wrapper) monitorSVID() {
 		case <-ticker.C:
 			if err := w.refreshSVID(w.ctx); err != nil {
 				consecutiveFailures++
-				w.logger.Error("failed to refresh SVID", 
-					"error", err, 
+				w.logger.Error("failed to refresh SVID",
+					"error", err,
 					"failures", consecutiveFailures,
-					"max_failures", maxFailures)
+					"max_failures", maxFailures,
+					"recovery_mode", inRecoveryMode)
 
-				if consecutiveFailures >= maxFailures {
-					w.logger.Error("SVID refresh failed multiple times - ATTESTATION FAILURE DETECTED",
+				if consecutiveFailures >= maxFailures && !inRecoveryMode {
+					w.logger.Error("ATTESTATION FAILURE - Keylime/SPIRE attestation lost",
 						"failures", consecutiveFailures,
-						"action", "sealing")
+						"action", "signaling Core to seal vault for security")
 
 					w.svidMutex.Lock()
 					w.currentSVID = nil
 					w.svidMutex.Unlock()
 
-					return
+					// Set attestation lost flag - Core will seal the vault
+					w.attestationMutex.Lock()
+					w.attestationLost = true
+					w.attestationMutex.Unlock()
+
+					// Enter recovery mode - continue polling at slower interval
+					inRecoveryMode = true
+					ticker.Reset(recoveryInterval)
+					w.logger.Info("entering SPIRE recovery mode - monitoring for attestation restoration",
+						"check_interval", recoveryInterval)
 				}
 			} else {
+				// Success!
+				if inRecoveryMode {
+					w.logger.Info("ATTESTATION RESTORED - SPIRE connection recovered",
+						"action", "will attempt auto-unseal")
+
+					// Clear attestation lost flag - Core will attempt auto-unseal
+					w.attestationMutex.Lock()
+					w.attestationLost = false
+					w.attestationMutex.Unlock()
+
+					inRecoveryMode = false
+					ticker.Reset(normalInterval)
+					w.logger.Info("resuming normal operation", "check_interval", normalInterval)
+				}
 				consecutiveFailures = 0
 			}
 		}

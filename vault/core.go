@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -395,6 +396,12 @@ type Core struct {
 
 	// metricsCh is used to stop the metrics streaming
 	metricsCh chan struct{}
+
+	// attestationMonitorStopCh is used to stop the attestation health monitor
+	attestationMonitorStopCh chan struct{}
+
+	// sealedDueToAttestationFailure tracks if vault was sealed due to attestation failure
+	sealedDueToAttestationFailure atomic.Value // stores bool
 
 	// metricsMutex is used to prevent a race condition between
 	// metrics emission and sealing leading to a nil pointer
@@ -1212,6 +1219,9 @@ func NewCore(conf *CoreConfig) (*Core, error) {
 		c.logger.Info("Initializing version history cache for core")
 		c.versionHistory = make(map[string]VaultVersion)
 	}
+
+	// Initialize attestation failure tracking
+	c.sealedDueToAttestationFailure.Store(false)
 
 	return c, nil
 }
@@ -2361,6 +2371,10 @@ func (s standardUnsealStrategy) unseal(ctx context.Context, logger log.Logger, c
 	c.metricsCh = make(chan struct{})
 	go c.emitMetricsActiveNode(c.metricsCh)
 
+	// Start attestation health monitor for fail-closed security model
+	c.attestationMonitorStopCh = make(chan struct{})
+	go c.monitorAttestationHealth(c.attestationMonitorStopCh)
+
 	// Establish version timestamps at the end of unseal on active nodes only.
 	if err := c.handleVersionTimeStamps(ctx); err != nil {
 		return err
@@ -2588,6 +2602,10 @@ func (c *Core) preSeal() error {
 	if c.metricsCh != nil {
 		close(c.metricsCh)
 		c.metricsCh = nil
+	}
+	if c.attestationMonitorStopCh != nil {
+		close(c.attestationMonitorStopCh)
+		c.attestationMonitorStopCh = nil
 	}
 	var result error
 
@@ -4027,4 +4045,105 @@ func (c *Core) DetectStateLockDeadlocks() bool {
 		return true
 	}
 	return false
+}
+
+// monitorAttestationHealth monitors the seal's attestation status and seals the vault
+// if attestation is lost (fail-closed security model). Continues monitoring even when
+// sealed to detect attestation restoration and trigger auto-unseal.
+func (c *Core) monitorAttestationHealth(stopCh chan struct{}) {
+	c.logger.Info("starting attestation health monitor")
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	checkCount := 0
+
+	for {
+		select {
+		case <-stopCh:
+			// Only stop if vault was NOT sealed due to attestation failure
+			// If sealed due to attestation failure, continue monitoring for restoration
+			sealedForAttestation := c.sealedDueToAttestationFailure.Load().(bool)
+			if !sealedForAttestation {
+				c.logger.Info("attestation health monitor stopped")
+				return
+			}
+			c.logger.Info("monitor continuing despite stop signal - vault sealed due to attestation failure")
+			stopCh = nil  // Prevent busy loop - this case won't fire again
+		case <-ticker.C:
+			checkCount++
+			c.logger.Debug("attestation health check", "check_number", checkCount)
+
+			// Check if this is a SPIRE seal wrapper
+			access := c.seal.GetAccess()
+			if access == nil {
+				c.logger.Debug("seal.GetAccess() returned nil, skipping check")
+				continue
+			}
+
+			// Get the underlying wrapper - use reflection to call GetWrapper method
+			accessValue := reflect.ValueOf(access)
+			getWrapperMethod := accessValue.MethodByName("GetWrapper")
+			if !getWrapperMethod.IsValid() {
+				continue
+			}
+
+			wrapperResults := getWrapperMethod.Call(nil)
+			if len(wrapperResults) == 0 || wrapperResults[0].IsNil() {
+				continue
+			}
+
+			wrapper := wrapperResults[0].Interface()
+			c.logger.Debug("got underlying wrapper", "type", fmt.Sprintf("%T", wrapper))
+
+			// Type assert to check if it implements attestation health checking
+			type attestationHealthChecker interface {
+				AttestationFailed() bool
+			}
+
+			healthChecker, ok := wrapper.(attestationHealthChecker)
+			if !ok {
+				c.logger.Debug("wrapper does not implement AttestationFailed interface",
+					"wrapper_type", fmt.Sprintf("%T", wrapper))
+				continue
+			}
+
+			attestationFailed := healthChecker.AttestationFailed()
+			sealed := c.Sealed()
+			sealedForAttestation := c.sealedDueToAttestationFailure.Load().(bool)
+
+			c.logger.Debug("attestation health status",
+				"attestation_failed", attestationFailed,
+				"vault_sealed", sealed,
+				"sealed_for_attestation", sealedForAttestation)
+
+			if attestationFailed && !sealed {
+				// Attestation lost and vault is still unsealed - SEAL IT for security
+				c.logger.Error("ATTESTATION FAILURE DETECTED - Sealing vault for security",
+					"reason", "Keylime/SPIRE attestation lost - system integrity cannot be verified")
+				
+				// Mark that we're sealing due to attestation failure
+				c.sealedDueToAttestationFailure.Store(true)
+				
+				if err := c.sealInternal(); err != nil {
+					c.logger.Error("failed to seal vault after attestation failure", "error", err)
+					c.sealedDueToAttestationFailure.Store(false) // Revert on failure
+				} else {
+					c.logger.Info("vault successfully sealed after attestation failure")
+				}
+			} else if !attestationFailed && sealed && sealedForAttestation {
+				// Attestation restored and vault was sealed due to attestation failure - AUTO-UNSEAL
+				c.logger.Info("ATTESTATION RESTORED - Attempting auto-unseal",
+					"reason", "Keylime/SPIRE attestation recovered")
+
+				// Attempt auto-unseal
+				if err := c.UnsealWithStoredKeys(context.Background()); err != nil {
+					c.logger.Error("auto-unseal failed after attestation restoration", "error", err)
+				} else {
+					c.logger.Info("vault successfully auto-unsealed after attestation restoration")
+					// Clear the flag since we're unsealed now
+					c.sealedDueToAttestationFailure.Store(false)
+				}
+			}
+		}
+	}
 }
